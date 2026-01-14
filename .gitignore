@@ -1,0 +1,18 @@
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+env/
+
+
+media/
+
+
+*/migrations/__pycache__/
+
+# Ignore SQLite database
+db.sqlite3
