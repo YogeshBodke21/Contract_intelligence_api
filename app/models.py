@@ -20,3 +20,11 @@ class Contract_fields(models.Model):
     indemnity = models.TextField(blank=True)
     liability_cap = models.JSONField(default=dict)  # {"amount": 1000, "currency": "USD"}
     signatories = models.JSONField(default=list)  # [{"name": "", "title": ""}]
+
+
+class DocumentChunk(models.Model):
+    document = models.ForeignKey('Document', on_delete=models.CASCADE, related_name='chunks')
+    chunk_id = models.IntegerField()  
+    text = models.TextField()
+    embedding = models.JSONField()  
+    page_number = models.IntegerField(null=True, blank=True)  
