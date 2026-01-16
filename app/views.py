@@ -8,8 +8,10 @@ import pdfplumber
 from Utils.extraction import extract_fields_from_file
 from Utils.embeddings import save_chunks_for_documents, embed_text
 from Utils.similarity import cosine_similarity
-from Utils.llm_response import call_llm
+from Utils.llm_response import call_llm, call_llm_stream
 import json
+from Utils.faiss import build_faiss_index, retrieve_chunks_for_risk, audit_chunk_with_llm, retrieve_top_chunks
+from django.http import StreamingHttpResponse
 # Create your views here.
 
 @api_view(['POST'])
@@ -76,6 +78,102 @@ def ask_question(request):
         top_chunks = similarities[:top]
         print(top_chunks)
         ans = call_llm(top_chunks, que)
-        return Response({'question':que, "Answer": ans})
+        return Response({'Document_id':doc, 'question':que, "Answer": ans})
     except Exception as e:
         return Response({"Error" : str(e)})
+
+
+
+RISK_QUERIES = {
+    "AUTO_RENEWAL": "automatic renewal clause with short notice period",
+    "UNLIMITED_LIABILITY": "unlimited liability clause",
+    "BROAD_INDEMNITY": "broad indemnification obligations"
+}
+
+
+@api_view(["POST"])
+def audit(request):
+    document_id = request.data.get("document_id")
+
+    if not document_id:
+        return Response({"error": "document_id is required"}, status=400)
+
+    # Fetch chunks
+    chunks = list(DocumentChunk.objects.filter(document=document_id))
+
+    if not chunks:
+        return Response({"error": "No chunks found for document"}, status=404)
+    # Build FAISS index
+    index = build_faiss_index(chunks)
+    unique_evidence = set()
+    findings = []
+    try:
+        for risk_type, risk_query in RISK_QUERIES.items():
+            retrieved_chunks = retrieve_chunks_for_risk(
+                risk_query=risk_query,
+                index=index,
+                chunks=chunks,
+                top_k=5
+            )
+            for chunk, score in retrieved_chunks:
+                llm_result = audit_chunk_with_llm(chunk.text, risk_type)
+                deserializer = json.loads(llm_result) #to convert it into python object - dict
+                print("llm result", deserializer)
+                if deserializer.get("contains_risk") is True:
+                    if deserializer.get("evidence").strip() not in unique_evidence:
+                        findings.append({
+                            "risk": risk_type,
+                            "severity": deserializer.get("severity"),
+                            "document_id": document_id,
+                            #"page": chunk.page or "",
+                            #"char_range": [chunk.char_start, chunk.char_end],
+                            "evidence": deserializer.get("evidence"),
+                            "similarity_score": score
+                        })
+        return Response({
+            "document_id": document_id,
+            "findings": findings
+        }, status = status.HTTP_200_OK)
+    
+    except Exception as e:
+        return Response({
+            "error": str(e),
+        }, status = status.HTTP_404_NOT_FOUND)
+
+
+#for Stream
+
+@api_view(['GET'])
+def ask_stream(request):
+    try:
+        que = request.GET.get("question")
+        doc = request.GET.get("document_id")
+
+        if not que or not doc:
+            return StreamingHttpResponse(
+                "data: Missing parameters\n\n",
+                content_type="text/event-stream"
+            )
+        # Fetch chunks
+        chunks = list(DocumentChunk.objects.filter(document=doc))
+        #  Reusing SAME RAG logic
+        top_chunks = retrieve_top_chunks(que, chunks)
+        print("top_chunks-- ",top_chunks)
+        def event_stream():
+            try:
+                for token in call_llm_stream(top_chunks, que):
+                    yield f"data: {json.dumps({'token': token})}\n\n" #dict to json
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return StreamingHttpResponse(
+            event_stream(),
+            content_type="text/event-stream"
+        )
+    except Exception as e:
+        return Response({
+            "error": str(e),
+        }, status = status.HTTP_404_NOT_FOUND)
+
