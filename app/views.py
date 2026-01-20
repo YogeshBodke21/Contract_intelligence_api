@@ -1,8 +1,8 @@
 from django.shortcuts import render
-from .serializers import DocumentSerializer, Contract_fields_serializer
+from .serializers import DocumentSerializer, Contract_fields_serializer, MultiPDFUploadSerializer, AskQuestionSerializer, AuditSerializer
 from .models import Document, Contract_fields, DocumentChunk
 from rest_framework.response import Response
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, parser_classes
 from rest_framework import status
 import pdfplumber
 from Utils.extraction import extract_fields_from_file
@@ -12,9 +12,28 @@ from Utils.llm_response import call_llm, call_llm_stream
 import json
 from Utils.faiss import build_faiss_index, retrieve_chunks_for_risk, audit_chunk_with_llm, retrieve_top_chunks
 from django.http import StreamingHttpResponse
-# Create your views here.
+from rest_framework.parsers import MultiPartParser, FormParser
+from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema
+from rest_framework import serializers
 
+
+
+metrics = {
+    "documents_ingested": Document.objects.count(),
+    "questions_answered": 0,
+    "audits_run": 0,
+}
+
+
+
+@extend_schema(
+    tags=["Ingest the document Pdfs"],
+    request=MultiPDFUploadSerializer,
+    responses={200: serializers.DictField()}
+)
 @api_view(['POST'])
+@parser_classes([MultiPartParser, FormParser])
 def ingest_view(request):
     files = request.FILES.getlist('files')
     print(files)
@@ -35,6 +54,7 @@ def ingest_view(request):
     print(docs)
     return Response({"Document IDs": docs },status=status.HTTP_201_CREATED)
 
+@extend_schema(tags=["Extract the document details"])
 @api_view(['POST'])
 def extract_details(request, pk):
     print("------>", pk)
@@ -60,6 +80,16 @@ def extract_details(request, pk):
         print(e)
         return Response({"Error":  str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+
+
+
+
+@extend_schema(
+        tags=['Ask Question'],
+    request=AskQuestionSerializer,
+    responses={200: serializers.DictField()},
+    description="Ask a question based on a document"
+)
 @api_view(['POST'])
 def ask_question(request):
     que = request.data.get("question")
@@ -78,6 +108,7 @@ def ask_question(request):
         top_chunks = similarities[:top]
         print(top_chunks)
         ans = call_llm(top_chunks, que)
+        metrics['questions_answered'] += 1
         return Response({'Document_id':doc, 'question':que, "Answer": ans})
     except Exception as e:
         return Response({"Error" : str(e)})
@@ -90,7 +121,12 @@ RISK_QUERIES = {
     "BROAD_INDEMNITY": "broad indemnification obligations"
 }
 
-
+@extend_schema(
+        tags=['Audit of given document'],
+    request=AuditSerializer,
+    responses={200: serializers.DictField()},
+    description="Audit of document with resk analysis."
+)
 @api_view(["POST"])
 def audit(request):
     document_id = request.data.get("document_id")
@@ -130,6 +166,7 @@ def audit(request):
                             "evidence": deserializer.get("evidence"),
                             "similarity_score": score
                         })
+        metrics["audits_run"] += 1
         return Response({
             "document_id": document_id,
             "findings": findings
@@ -142,12 +179,18 @@ def audit(request):
 
 
 #for Stream
-
-@api_view(['GET'])
+@extend_schema(
+        tags=['Ask Question - stream answer'],
+        request=AskQuestionSerializer,
+        responses={200: serializers.DictField()},
+        description="Ask a question based on a document"
+)
+@api_view(['POST'])
 def ask_stream(request):
     try:
-        que = request.GET.get("question")
-        doc = request.GET.get("document_id")
+        #que = request.GET.get("question") for GET request
+        que = request.data.get("question")
+        doc = request.data.get("document_id")
 
         if not que or not doc:
             return StreamingHttpResponse(
@@ -177,3 +220,9 @@ def ask_stream(request):
             "error": str(e),
         }, status = status.HTTP_404_NOT_FOUND)
 
+@extend_schema(
+        tags=['Metrics of API']
+)
+@api_view(['GET'])
+def get_metrics(request):
+    return Response({"metrics":metrics}, status=status.HTTP_200_OK)
